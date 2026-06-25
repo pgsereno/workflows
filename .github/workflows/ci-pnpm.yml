@@ -58,8 +58,11 @@ jobs:
           node-version: ${{ inputs.node-version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # useblacksmith/cache is archived — Blacksmith now accelerates the upstream
+      # actions/cache transparently on its runners (no code change, just faster).
+      # actions/cache@v6 also runs on node24 (no deprecation warning).
       - name: Restore Turbo cache
-        uses: useblacksmith/cache@v5
+        uses: actions/cache@v6
         with:
           path: .turbo
           key: turbo-static-${{ github.sha }}
@@ -147,8 +150,11 @@ jobs:
           node-version: ${{ inputs.node-version }}
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      # useblacksmith/cache is archived — Blacksmith now accelerates the upstream
+      # actions/cache transparently on its runners (no code change, just faster).
+      # actions/cache@v6 also runs on node24 (no deprecation warning).
       - name: Restore Turbo cache
-        uses: useblacksmith/cache@v5
+        uses: actions/cache@v6
         with:
           path: .turbo
           key: turbo-build-${{ github.sha }}
