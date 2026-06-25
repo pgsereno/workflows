@@ -1,0 +1,57 @@
+name: Deploy (Vercel)
+
+# Reusable Vercel deploy from CI. Vercel Hobby can't connect a private
+# org-owned repo's Git integration, so we deploy from CI. The build runs ON
+# VERCEL (no --prebuilt) so the Neon↔Vercel integration injects POSTGRES_URL
+# and branches per preview, exactly as a Git-triggered deploy would.
+# Caller example:
+#   jobs:
+#     deploy:
+#       uses: pgsereno/workflows/.github/workflows/deploy-vercel.yml@main
+#       with:
+#         vercel-org-id: team_xxx
+#         vercel-project-id: prj_xxx
+#       secrets:
+#         VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+on:
+  workflow_call:
+    inputs:
+      vercel-org-id:
+        description: Vercel team/org ID (not secret — lives in .vercel/project.json).
+        type: string
+        required: true
+      vercel-project-id:
+        description: Vercel project ID (not secret).
+        type: string
+        required: true
+      vercel-cli-version:
+        description: Vercel CLI major version to install.
+        type: string
+        default: "54"
+    secrets:
+      VERCEL_TOKEN:
+        required: true
+
+jobs:
+  deploy:
+    name: Vercel Deploy
+    runs-on: blacksmith
+    env:
+      VERCEL_ORG_ID: ${{ inputs.vercel-org-id }}
+      VERCEL_PROJECT_ID: ${{ inputs.vercel-project-id }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+      - run: npm i -g vercel@${{ inputs.vercel-cli-version }}
+
+      # --archive=tgz uploads one tarball instead of many files, avoiding
+      # Vercel's per-day uploaded-file-count limit.
+      - name: Deploy preview
+        if: github.event_name == 'pull_request'
+        run: vercel deploy --archive=tgz --token="${{ secrets.VERCEL_TOKEN }}" --yes
+
+      - name: Deploy production
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: vercel deploy --prod --archive=tgz --token="${{ secrets.VERCEL_TOKEN }}" --yes

@@ -1,0 +1,159 @@
+name: CI (pnpm)
+
+# Reusable CI for pnpm/Turbo monorepos on Blacksmith runners.
+# Caller example:
+#   jobs:
+#     ci:
+#       uses: pgsereno/workflows/.github/workflows/ci-pnpm.yml@main
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Node.js version for setup-node.
+        type: string
+        default: "24"
+      run-knip:
+        description: Run the knip unused-code check.
+        type: boolean
+        default: true
+      run-test:
+        description: Run the Vitest + Postgres test job.
+        type: boolean
+        default: true
+      run-build:
+        description: Run the production build job.
+        type: boolean
+        default: true
+      build-node-options:
+        description: NODE_OPTIONS for the build (heap size etc.).
+        type: string
+        default: "--max-old-space-size=8192"
+
+jobs:
+  secrets-scan:
+    name: Secrets Scan
+    runs-on: blacksmith
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # gitleaks-action requires a paid license for org repos; the binary is
+      # free. Pinned, no :latest drift. Same history scan the lefthook hook runs.
+      - name: Gitleaks (full history)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          ./gitleaks git --redact -v .
+
+  static-checks:
+    name: Static Checks
+    runs-on: blacksmith
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.0.9
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Restore Turbo cache
+        uses: useblacksmith/cache@v5
+        with:
+          path: .turbo
+          key: turbo-static-${{ github.sha }}
+          restore-keys: |
+            turbo-static-
+      - run: pnpm lint
+      - run: pnpm format:check
+      - run: pnpm exec turbo run type-check --cache-dir=.turbo
+      - name: Knip (unused code)
+        if: ${{ inputs.run-knip }}
+        run: pnpm exec turbo run knip --cache-dir=.turbo
+
+  test:
+    name: Test
+    if: ${{ inputs.run-test }}
+    runs-on: blacksmith
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: dev
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: app
+        ports:
+          - 5435:5432
+        options: >-
+          --health-cmd "pg_isready -U dev -d app"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      POSTGRES_URL: postgres://dev:dev@localhost:5435/app
+      TEST_DATABASE_URL: postgres://dev:dev@localhost:5435/app_test
+      SKIP_ENV_VALIDATION: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.0.9
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Create test database and extensions
+        run: |
+          PGPASSWORD=dev psql -h localhost -p 5435 -U dev -d app -c "CREATE EXTENSION IF NOT EXISTS unaccent;"
+          PGPASSWORD=dev psql -h localhost -p 5435 -U dev -d app -c "CREATE DATABASE app_test OWNER dev;"
+          PGPASSWORD=dev psql -h localhost -p 5435 -U dev -d app_test -c "CREATE EXTENSION IF NOT EXISTS unaccent;"
+
+      - name: Push schema to test database
+        run: cd packages/db && POSTGRES_URL=postgres://dev:dev@localhost:5435/app_test pnpm exec drizzle-kit push --force
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f apps/web/coverage/coverage-summary.json ]; then
+            STATEMENTS=$(node -e "const c=require('./apps/web/coverage/coverage-summary.json');console.log(c.total.statements.pct)")
+            BRANCHES=$(node -e "const c=require('./apps/web/coverage/coverage-summary.json');console.log(c.total.branches.pct)")
+            FUNCTIONS=$(node -e "const c=require('./apps/web/coverage/coverage-summary.json');console.log(c.total.functions.pct)")
+            LINES=$(node -e "const c=require('./apps/web/coverage/coverage-summary.json');console.log(c.total.lines.pct)")
+            echo "### 📊 Test Coverage" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Coverage |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|----------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Statements | ${STATEMENTS}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Branches | ${BRANCHES}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Functions | ${FUNCTIONS}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Lines | ${LINES}% |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  build:
+    name: Build
+    if: ${{ inputs.run-build }}
+    runs-on: blacksmith
+    env:
+      SKIP_ENV_VALIDATION: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6.0.9
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Restore Turbo cache
+        uses: useblacksmith/cache@v5
+        with:
+          path: .turbo
+          key: turbo-build-${{ github.sha }}
+          restore-keys: |
+            turbo-build-
+      - run: pnpm exec turbo run build --cache-dir=.turbo
+        env:
+          NODE_OPTIONS: ${{ inputs.build-node-options }}
