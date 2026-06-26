@@ -1,0 +1,176 @@
+name: CI (bun)
+
+# Reusable CI for bun/Turbo monorepos on Blacksmith runners.
+# The bun-flavored sibling of ci-pnpm.yml — same jobs, swapped toolchain
+# (oven-sh/setup-bun + bun install + biome). The web app still builds with
+# Vite/Turbo, so node stays on PATH for tool shebangs (tsc, vite, knip).
+# Caller example:
+#   jobs:
+#     ci:
+#       uses: pgsereno/workflows/.github/workflows/ci-bun.yml@main
+on:
+  workflow_call:
+    inputs:
+      bun-version:
+        description: Bun version for setup-bun (matches package.json packageManager).
+        type: string
+        default: "1.3.5"
+      node-version:
+        description: Node.js version — needed for tsc/vite/knip shebangs spawned by Turbo.
+        type: string
+        default: "24"
+      test-script:
+        description: Root package.json script the test job runs (produces coverage-summary.json).
+        type: string
+        default: "test:coverage"
+      build-node-options:
+        description: NODE_OPTIONS for the build (heap size etc.).
+        type: string
+        default: "--max-old-space-size=8192"
+
+jobs:
+  secrets-scan:
+    name: Secrets Scan
+    runs-on: blacksmith
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # gitleaks-action requires a paid license for org repos; the binary is
+      # free. Pinned, no :latest drift. Same history scan the lefthook hook runs.
+      - name: Gitleaks (full history)
+        env:
+          GITLEAKS_VERSION: 8.30.1
+        run: |
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" | tar -xz gitleaks
+          ./gitleaks git --redact -v .
+
+  static-checks:
+    name: Static Checks
+    runs-on: blacksmith
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+      # useblacksmith/cache is archived — Blacksmith now accelerates the upstream
+      # actions/cache transparently on its runners (no code change, just faster).
+      # actions/cache@v6 also runs on node24 (no deprecation warning).
+      - name: Restore bun + Turbo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.bun/install/cache
+            .turbo
+          key: bun-static-${{ runner.os }}-${{ hashFiles('bun.lock') }}-${{ github.sha }}
+          restore-keys: |
+            bun-static-${{ runner.os }}-${{ hashFiles('bun.lock') }}-
+            bun-static-${{ runner.os }}-
+      - run: bun install --frozen-lockfile
+      # biome check covers lint + format + import sorting in one pass; lint is
+      # hardened with --error-on-warnings (the --max-warnings=0 equivalent).
+      - run: bun run lint
+      - run: bun run format:check
+      - run: bunx turbo run type-check --cache-dir=.turbo
+      - run: bunx turbo run knip --cache-dir=.turbo
+
+  test:
+    name: Test
+    runs-on: blacksmith
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: dev
+          POSTGRES_PASSWORD: dev
+          POSTGRES_DB: finances
+        ports:
+          - 5435:5432
+        options: >-
+          --health-cmd "pg_isready -U dev -d finances"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      POSTGRES_URL: postgres://dev:dev@localhost:5435/finances
+      TEST_DATABASE_URL: postgres://dev:dev@localhost:5435/finances_test
+      CREDENTIALS_ENCRYPTION_KEY: ci-test-encryption-key-not-for-production
+      SKIP_ENV_VALIDATION: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Restore bun cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.bun/install/cache
+          key: bun-test-${{ runner.os }}-${{ hashFiles('bun.lock') }}
+          restore-keys: |
+            bun-test-${{ runner.os }}-
+      - run: bun install --frozen-lockfile
+
+      - name: Create test database and extensions
+        run: |
+          PGPASSWORD=dev psql -h localhost -p 5435 -U dev -d finances -c "CREATE EXTENSION IF NOT EXISTS unaccent;"
+          PGPASSWORD=dev psql -h localhost -p 5435 -U dev -d finances -c "CREATE DATABASE finances_test OWNER dev;"
+          PGPASSWORD=dev psql -h localhost -p 5435 -U dev -d finances_test -c "CREATE EXTENSION IF NOT EXISTS unaccent;"
+
+      - name: Migrate test database
+        run: cd packages/db && POSTGRES_URL=postgres://dev:dev@localhost:5435/finances_test bunx drizzle-kit migrate
+
+      - name: Run tests
+        run: bun run ${{ inputs.test-script }}
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          if [ -f apps/web/coverage/coverage-summary.json ]; then
+            STATEMENTS=$(bun -e "const c=require('./apps/web/coverage/coverage-summary.json');console.log(c.total.statements.pct)")
+            BRANCHES=$(bun -e "const c=require('./apps/web/coverage/coverage-summary.json');console.log(c.total.branches.pct)")
+            FUNCTIONS=$(bun -e "const c=require('./apps/web/coverage/coverage-summary.json');console.log(c.total.functions.pct)")
+            LINES=$(bun -e "const c=require('./apps/web/coverage/coverage-summary.json');console.log(c.total.lines.pct)")
+            echo "### 📊 Test Coverage" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "| Metric | Coverage |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|----------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Statements | ${STATEMENTS}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Branches | ${BRANCHES}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Functions | ${FUNCTIONS}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| Lines | ${LINES}% |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  build:
+    name: Build
+    runs-on: blacksmith
+    env:
+      SKIP_ENV_VALIDATION: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ inputs.bun-version }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ inputs.node-version }}
+      - name: Restore bun + Turbo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.bun/install/cache
+            .turbo
+          key: bun-build-${{ runner.os }}-${{ hashFiles('bun.lock') }}-${{ github.sha }}
+          restore-keys: |
+            bun-build-${{ runner.os }}-${{ hashFiles('bun.lock') }}-
+            bun-build-${{ runner.os }}-
+      - run: bun install --frozen-lockfile
+      - run: bunx turbo run build --cache-dir=.turbo
+        env:
+          NODE_OPTIONS: ${{ inputs.build-node-options }}
