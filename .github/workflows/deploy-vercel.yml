@@ -75,8 +75,10 @@ jobs:
             > deploy-out.txt 2> deploy-err.txt || { cat deploy-err.txt >&2; exit 1; }
           cat deploy-err.txt >&2
           url=$(tail -n1 deploy-out.txt)
+          # Scope to the "Inspect:" line — vercel also prints an unrelated
+          # vercel.com/docs telemetry URL we must not grab.
           inspect=$(sed -E 's/\x1b\[[0-9;]*m//g' deploy-err.txt \
-            | grep -oE 'https://vercel\.com/[^ ]+' | head -n1 || true)
+            | grep -iE 'inspect' | grep -oE 'https://vercel\.com/[^ ]+' | head -n1 || true)
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "inspect=$inspect" >> "$GITHUB_OUTPUT"
 
