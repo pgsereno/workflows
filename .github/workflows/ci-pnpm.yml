@@ -12,22 +12,6 @@ on:
         description: Node.js version for setup-node.
         type: string
         default: "24"
-      run-format:
-        description: Run the oxfmt format check (set false if the repo has no format:check script).
-        type: boolean
-        default: true
-      run-knip:
-        description: Run the knip unused-code check.
-        type: boolean
-        default: true
-      run-test:
-        description: Run the Vitest + Postgres test job.
-        type: boolean
-        default: true
-      run-build:
-        description: Run the production build job.
-        type: boolean
-        default: true
       build-node-options:
         description: NODE_OPTIONS for the build (heap size etc.).
         type: string
@@ -73,17 +57,12 @@ jobs:
           restore-keys: |
             turbo-static-
       - run: pnpm lint
-      - name: Format check
-        if: ${{ inputs.run-format }}
-        run: pnpm format:check
+      - run: pnpm format:check
       - run: pnpm exec turbo run type-check --cache-dir=.turbo
-      - name: Knip (unused code)
-        if: ${{ inputs.run-knip }}
-        run: pnpm exec turbo run knip --cache-dir=.turbo
+      - run: pnpm exec turbo run knip --cache-dir=.turbo
 
   test:
     name: Test
-    if: ${{ inputs.run-test }}
     runs-on: blacksmith
     services:
       postgres:
@@ -144,7 +123,6 @@ jobs:
 
   build:
     name: Build
-    if: ${{ inputs.run-build }}
     runs-on: blacksmith
     env:
       SKIP_ENV_VALIDATION: true
