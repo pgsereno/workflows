@@ -63,14 +63,22 @@ jobs:
       - run: npm i -g vercel@${{ inputs.vercel-cli-version }}
 
       # --archive=tgz uploads one tarball instead of many files, avoiding
-      # Vercel's per-day uploaded-file-count limit. The CLI prints progress
-      # to stderr and the deployment URL to stdout (last line) — capture it.
+      # Vercel's per-day uploaded-file-count limit. The CLI prints the
+      # deployment URL to stdout (last line) and the "Inspect:" build-logs
+      # URL to stderr — capture both (strip ANSI before grepping).
       - name: Deploy preview
         id: preview
         if: github.event_name == 'pull_request'
         run: |
-          url=$(vercel deploy --archive=tgz --token="${{ secrets.VERCEL_TOKEN }}" --yes | tail -n1)
+          set -o pipefail
+          vercel deploy --archive=tgz --token="${{ secrets.VERCEL_TOKEN }}" --yes \
+            > deploy-out.txt 2> deploy-err.txt || { cat deploy-err.txt >&2; exit 1; }
+          cat deploy-err.txt >&2
+          url=$(tail -n1 deploy-out.txt)
+          inspect=$(sed -E 's/\x1b\[[0-9;]*m//g' deploy-err.txt \
+            | grep -oE 'https://vercel\.com/[^ ]+' | head -n1 || true)
           echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "inspect=$inspect" >> "$GITHUB_OUTPUT"
 
       # Replaces the comment the Vercel Git integration used to post. Sticky
       # via a hidden marker so re-runs update one comment instead of stacking.
@@ -82,17 +90,22 @@ jobs:
         uses: actions/github-script@v8
         env:
           PREVIEW_URL: ${{ steps.preview.outputs.url }}
+          INSPECT_URL: ${{ steps.preview.outputs.inspect }}
         with:
           script: |
             const url = process.env.PREVIEW_URL;
+            const inspect = process.env.INSPECT_URL;
+            const sha = context.payload.pull_request.head.sha.slice(0, 7);
+            const updated = new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC";
+            const inspectCell = inspect ? `[Inspect](${inspect})` : "—";
             const marker = "<!-- vercel-preview-deployment -->";
             const body = [
               marker,
               "### ▲ Vercel preview deploy",
               "",
-              "| Project | Deployment | Commit | Updated (UTC) |",
-              "|---|---|---|---|",
-              `| \`${context.repo.repo}\` | ✅ [Visit Preview](${url}) | \`${context.payload.pull_request.head.sha.slice(0, 7)}\` | ${new Date().toISOString().replace("T", " ").slice(0, 16)} |`,
+              "| Project | Status | Preview | Inspect | Commit | Updated |",
+              "|---|---|---|---|---|---|",
+              `| \`${context.repo.repo}\` | ✅ Ready | [Visit Preview](${url}) | ${inspectCell} | \`${sha}\` | ${updated} |`,
             ].join("\n");
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
