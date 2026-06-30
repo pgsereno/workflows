@@ -56,7 +56,16 @@ jobs:
       VERCEL_ORG_ID: ${{ inputs.vercel-org-id }}
       VERCEL_PROJECT_ID: ${{ inputs.vercel-project-id }}
     steps:
+      # On pull_request, actions/checkout defaults to a DETACHED checkout of
+      # the merge commit, so `vercel deploy` can't read a branch name and
+      # records VERCEL_GIT_COMMIT_REF=HEAD. The Neon integration then names its
+      # branch preview/$VERCEL_GIT_COMMIT_REF, collapsing every PR onto one
+      # shared `preview/HEAD` branch — whose migration state drifts and breaks
+      # `drizzle-kit migrate`. Checking out the named head branch gives Vercel
+      # the real ref → one isolated Neon branch per PR. Empty on push → main.
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
