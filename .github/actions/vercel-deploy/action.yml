@@ -1,0 +1,41 @@
+name: Vercel deploy
+description: Deploy the checked-out repo with the Vercel CLI, wait for a final state, and post the preview URL on the PR.
+inputs:
+  vercel-token:
+    description: Vercel token.
+    required: true
+  ready-timeout-minutes:
+    description: Minutes to wait for the deployment to finish before failing.
+    default: "15"
+  github-token:
+    description: Token for the sticky PR comment (needs pull-requests write).
+    default: ${{ github.token }}
+outputs:
+  url:
+    description: Deployment URL.
+    value: ${{ steps.deploy.outputs.url }}
+  state:
+    description: Final readyState (READY, BLOCKED, ERROR, CANCELED, or BUILDING on timeout).
+    value: ${{ steps.deploy.outputs.state }}
+runs:
+  using: composite
+  steps:
+    - id: deploy
+      shell: bash
+      env:
+        VERCEL_TOKEN: ${{ inputs.vercel-token }}
+        TIMEOUT: ${{ inputs.ready-timeout-minutes }}m
+      run: ${{ github.action_path }}/deploy.sh
+
+    # A caller that didn't grant pull-requests: write still gets its deploy
+    # result, just no comment.
+    - if: always() && github.event_name == 'pull_request' && steps.deploy.outputs.url != ''
+      continue-on-error: true
+      uses: actions/github-script@v8
+      env:
+        PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+        INSPECT_URL: ${{ steps.deploy.outputs.inspect }}
+        STATE: ${{ steps.deploy.outputs.state }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: await require(`${process.env.GITHUB_ACTION_PATH}/comment.js`)({ github, context })
