@@ -42,7 +42,7 @@ Deploys from CI via the Vercel CLI (build runs on Vercel, so Neon preview
 branching + migrations behave exactly like a Git-triggered deploy). PR → preview,
 push to `main` → production. Uploads a single tarball (`--archive=tgz`).
 
-The deploy logic lives in the composite action [`.github/actions/vercel-deploy`](.github/actions/vercel-deploy) (`deploy.sh`, `comment.js`), which a job can also use directly after checkout and installing the CLI. The job fails as soon as Vercel reports a final state other than `READY` (e.g. `BLOCKED`: the commit author is not on the Vercel team, see [Troubleshoot project collaboration](https://vercel.com/docs/deployments/troubleshoot-project-collaboration)), or after `ready-timeout-minutes`.
+The deploy logic lives in the composite action [`.github/actions/vercel-deploy`](.github/actions/vercel-deploy) (`deploy.sh`, plus [sticky-pull-request-comment](https://github.com/marocchino/sticky-pull-request-comment) for the PR comment), which a job can also use directly after checkout and installing the CLI. The job fails as soon as Vercel reports a final state other than `READY` (e.g. `BLOCKED`: the commit author is not on the Vercel team, see [Troubleshoot project collaboration](https://vercel.com/docs/deployments/troubleshoot-project-collaboration)), or after `ready-timeout-minutes`.
 
 ```yaml
 name: Deploy

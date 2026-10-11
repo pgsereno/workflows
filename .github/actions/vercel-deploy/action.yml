@@ -31,11 +31,13 @@ runs:
     # result, just no comment.
     - if: always() && github.event_name == 'pull_request' && steps.deploy.outputs.url != ''
       continue-on-error: true
-      uses: actions/github-script@v8
-      env:
-        PREVIEW_URL: ${{ steps.deploy.outputs.url }}
-        INSPECT_URL: ${{ steps.deploy.outputs.inspect }}
-        STATE: ${{ steps.deploy.outputs.state }}
+      uses: marocchino/sticky-pull-request-comment@v3.0.5
       with:
-        github-token: ${{ inputs.github-token }}
-        script: await require(`${process.env.GITHUB_ACTION_PATH}/comment.js`)({ github, context })
+        header: vercel-preview
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        message: |
+          ### ▲ Vercel preview deploy
+
+          | Status | Preview | Inspect | Commit |
+          |---|---|---|---|
+          | ${{ steps.deploy.outputs.state == 'READY' && '✅ Ready' || format('❌ {0}', steps.deploy.outputs.state) }} | ${{ steps.deploy.outputs.state == 'READY' && format('[Visit Preview]({0})', steps.deploy.outputs.url) || '—' }} | [Inspect](${{ steps.deploy.outputs.inspect }}) | `${{ github.event.pull_request.head.sha }}` |
