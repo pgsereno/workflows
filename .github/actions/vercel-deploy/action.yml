@@ -25,7 +25,8 @@ runs:
       env:
         VERCEL_TOKEN: ${{ inputs.vercel-token }}
         TIMEOUT: ${{ inputs.ready-timeout-minutes }}m
-      run: ${{ github.action_path }}/deploy.sh
+      # exec, so the runner's cancel signal reaches deploy.sh's trap.
+      run: exec ${{ github.action_path }}/deploy.sh
 
     # A caller that didn't grant pull-requests: write still gets its deploy
     # result, just no comment.

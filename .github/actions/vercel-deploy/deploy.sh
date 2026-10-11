@@ -40,7 +40,10 @@ inspect=$(grep -i inspect "$RUNNER_TEMP/out.txt" | grep -oE 'https://vercel\.com
 echo "inspect=$inspect" >> "$GITHUB_OUTPUT"
 
 # Exits 0 on BLOCKED and 124 on timeout; the state check below decides.
-vercel inspect "$url" --wait --timeout "$TIMEOUT" --format json > "$RUNNER_TEMP/inspect.json" || true
+# In the background so `wait` returns the moment a signal arrives; a
+# foreground child would hold the trap until it exits.
+vercel inspect "$url" --wait --timeout "$TIMEOUT" --format json > "$RUNNER_TEMP/inspect.json" &
+wait $! || true
 state=$(jq -r '.readyState // "UNKNOWN"' "$RUNNER_TEMP/inspect.json" 2>/dev/null || echo UNKNOWN)
 echo "state=$state" >> "$GITHUB_OUTPUT"
 case "$state" in
