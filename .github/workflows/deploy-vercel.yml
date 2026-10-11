@@ -79,7 +79,7 @@ jobs:
       - run: npm i -g vercel@${{ inputs.vercel-cli-version }}
 
       - if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-        uses: pgsereno/workflows/.github/actions/vercel-deploy@claude/project-thread-u170jd
+        uses: pgsereno/workflows/.github/actions/vercel-deploy@main
         with:
           vercel-token: ${{ secrets.VERCEL_TOKEN }}
           ready-timeout-minutes: ${{ inputs.ready-timeout-minutes }}
