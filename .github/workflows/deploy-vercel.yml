@@ -38,9 +38,13 @@ on:
         type: string
         required: true
       vercel-cli-version:
-        description: Vercel CLI major version to install.
+        description: Vercel CLI version (or major) to install.
         type: string
-        default: "54"
+        default: "63"
+      ready-timeout-minutes:
+        description: Minutes to wait for the deployment to finish before failing the job. Keep it under 25; the job is capped at 30.
+        type: number
+        default: 15
     secrets:
       VERCEL_TOKEN:
         required: true
@@ -49,6 +53,9 @@ jobs:
   deploy:
     name: Vercel Deploy
     runs-on: blacksmith
+    # Hard cap on cost: a hung CLI or API call can never bill hours again. Keep
+    # it above ready-timeout-minutes plus install/upload time.
+    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
@@ -71,44 +78,61 @@ jobs:
           node-version: "24"
       - run: npm i -g vercel@${{ inputs.vercel-cli-version }}
 
-      # --archive=tgz uploads one tarball instead of many files, avoiding
-      # Vercel's per-day uploaded-file-count limit. The CLI prints the
-      # deployment URL to stdout (last line) and the "Inspect:" build-logs
-      # URL to stderr — capture both (strip ANSI before grepping).
-      - name: Deploy preview
-        id: preview
-        if: github.event_name == 'pull_request'
+      # `vercel deploy` waits only for READY or ERROR, so a deployment Vercel
+      # parks in BLOCKED (commit author not on the team) kept it polling for
+      # hours. Create it with --no-wait, then `vercel inspect --wait`, which
+      # stops on any final state. --archive=tgz uploads one tarball instead
+      # of many files, avoiding Vercel's per-day uploaded-file-count limit.
+      - name: Deploy
+        id: deploy
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          TIMEOUT: ${{ inputs.ready-timeout-minutes }}m
         run: |
-          set -o pipefail
-          vercel deploy --archive=tgz --token="${{ secrets.VERCEL_TOKEN }}" --yes \
-            > deploy-out.txt 2> deploy-err.txt || { cat deploy-err.txt >&2; exit 1; }
-          cat deploy-err.txt >&2
-          url=$(tail -n1 deploy-out.txt)
-          # Scope to the "Inspect:" line — vercel also prints an unrelated
-          # vercel.com/docs telemetry URL we must not grab.
-          inspect=$(sed -E 's/\x1b\[[0-9;]*m//g' deploy-err.txt \
-            | grep -iE 'inspect' | grep -oE 'https://vercel\.com/[^ ]+' | head -n1 || true)
+          # The CLI exits 1 when the deployment is created already BLOCKED, so
+          # don't stop here: take the URL from either stream and ask Vercel.
+          args=(--archive=tgz --yes --no-wait)
+          [ "$GITHUB_EVENT_NAME" = push ] && args+=(--prod)
+          vercel deploy "${args[@]}" > out.txt 2>&1 || true
+          cat out.txt
+          url=$(grep -oE 'https://[^ ]+\.vercel\.app' out.txt | tail -n1)
+          [ -n "$url" ] || { echo "::error::vercel deploy did not create a deployment"; exit 1; }
           echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "inspect=$inspect" >> "$GITHUB_OUTPUT"
+          # Scope to the "Inspect" line: the CLI also prints a telemetry docs URL.
+          echo "inspect=$(grep -i inspect out.txt | grep -oE 'https://vercel\.com/[^ ]+' | head -n1)" >> "$GITHUB_OUTPUT"
+
+          # Exits 0 on BLOCKED and 124 on timeout; the state check below decides.
+          vercel inspect "$url" --wait --timeout "$TIMEOUT" --format json > inspect.json || true
+          state=$(jq -r '.readyState // "UNKNOWN"' inspect.json)
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          if [ "$state" != READY ]; then
+            echo "::error::Deployment $state: $(jq -r '.readyStateReason // empty' inspect.json) $url"
+            exit 1
+          fi
 
       # Replaces the comment the Vercel Git integration used to post. Sticky
       # via a hidden marker so re-runs update one comment instead of stacking.
       # continue-on-error: a caller that didn't grant pull-requests: write
       # still gets a green deploy, just no comment.
       - name: Comment preview URL on PR
-        if: github.event_name == 'pull_request' && steps.preview.outputs.url != ''
+        if: always() && github.event_name == 'pull_request' && steps.deploy.outputs.url != ''
         continue-on-error: true
         uses: actions/github-script@v8
         env:
-          PREVIEW_URL: ${{ steps.preview.outputs.url }}
-          INSPECT_URL: ${{ steps.preview.outputs.inspect }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          INSPECT_URL: ${{ steps.deploy.outputs.inspect }}
+          STATE: ${{ steps.deploy.outputs.state }}
         with:
           script: |
             const url = process.env.PREVIEW_URL;
             const inspect = process.env.INSPECT_URL;
+            const state = process.env.STATE || "UNKNOWN";
+            const status = state === "READY" ? "✅ Ready" : `❌ ${state}`;
             const sha = context.payload.pull_request.head.sha.slice(0, 7);
             const updated = new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC";
             const inspectCell = inspect ? `[Inspect](${inspect})` : "—";
+            const previewCell = state === "READY" ? `[Visit Preview](${url})` : "—";
             const marker = "<!-- vercel-preview-deployment -->";
             const body = [
               marker,
@@ -116,7 +140,7 @@ jobs:
               "",
               "| Project | Status | Preview | Inspect | Commit | Updated |",
               "|---|---|---|---|---|---|",
-              `| \`${context.repo.repo}\` | ✅ Ready | [Visit Preview](${url}) | ${inspectCell} | \`${sha}\` | ${updated} |`,
+              `| \`${context.repo.repo}\` | ${status} | ${previewCell} | ${inspectCell} | \`${sha}\` | ${updated} |`,
             ].join("\n");
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
@@ -127,7 +151,3 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
-
-      - name: Deploy production
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: vercel deploy --prod --archive=tgz --token="${{ secrets.VERCEL_TOKEN }}" --yes
