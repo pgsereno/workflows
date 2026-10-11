@@ -95,15 +95,20 @@ jobs:
           set -euo pipefail
           args=(deploy --archive=tgz --yes --no-wait --token="$VERCEL_TOKEN")
           [ "$PRODUCTION" = true ] && args+=(--prod)
-          if ! vercel "${args[@]}" > deploy-out.txt 2> deploy-err.txt; then
-            cat deploy-err.txt >&2
-            echo "::error title=Vercel deploy::vercel deploy failed before the deployment was created"
-            exit 1
-          fi
+          # Even with --no-wait the CLI exits 1 ("Your deployment failed") when
+          # the deployment is created already BLOCKED, so read its URL from
+          # either stream and let the API say what happened.
+          rc=0
+          vercel "${args[@]}" > deploy-out.txt 2> deploy-err.txt || rc=$?
           cat deploy-err.txt >&2
-          url=$(grep -oE 'https://[^[:space:]]+' deploy-out.txt | tail -n1 || true)
+          url=$(grep -oE 'https://[^[:space:]]+\.vercel\.app' deploy-out.txt | tail -n1 || true)
           if [ -z "$url" ]; then
-            echo "::error title=Vercel deploy::could not read the deployment URL from the CLI output"
+            url=$(sed -E 's/\x1b\[[0-9;]*m//g' deploy-err.txt \
+              | grep -E '^[[:space:]]*(Preview|Production)[[:space:]]' \
+              | grep -oE 'https://[^[:space:]]+\.vercel\.app' | head -n1 || true)
+          fi
+          if [ -z "$url" ]; then
+            echo "::error title=Vercel deploy::vercel deploy exited $rc without creating a deployment"
             exit 1
           fi
           echo "url=$url" >> "$GITHUB_OUTPUT"
