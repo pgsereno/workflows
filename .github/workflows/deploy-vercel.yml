@@ -38,9 +38,13 @@ on:
         type: string
         required: true
       vercel-cli-version:
-        description: Vercel CLI major version to install.
+        description: Vercel CLI version (or major) to install.
         type: string
-        default: "54"
+        default: "63"
+      ready-timeout-minutes:
+        description: How long to wait for the deployment to reach READY before failing and canceling it.
+        type: number
+        default: 15
     secrets:
       VERCEL_TOKEN:
         required: true
@@ -49,6 +53,9 @@ jobs:
   deploy:
     name: Vercel Deploy
     runs-on: blacksmith
+    # Hard cap on cost: a hung CLI or API call can never bill hours again. Keep
+    # it above ready-timeout-minutes plus install/upload time.
+    timeout-minutes: 30
     permissions:
       contents: read
       pull-requests: write
@@ -71,44 +78,119 @@ jobs:
           node-version: "24"
       - run: npm i -g vercel@${{ inputs.vercel-cli-version }}
 
-      # --archive=tgz uploads one tarball instead of many files, avoiding
-      # Vercel's per-day uploaded-file-count limit. The CLI prints the
-      # deployment URL to stdout (last line) and the "Inspect:" build-logs
-      # URL to stderr — capture both (strip ANSI before grepping).
-      - name: Deploy preview
-        id: preview
-        if: github.event_name == 'pull_request'
+      # The CLI's own wait loop only stops on READY or ERROR, so a deployment
+      # Vercel parks in BLOCKED (commit author not on the team) or that gets
+      # CANCELED keeps it polling until the job is killed. Create with
+      # --no-wait and poll the deployment ourselves, failing on any terminal
+      # state. --archive=tgz uploads one tarball instead of many files,
+      # avoiding Vercel's per-day uploaded-file-count limit.
+      - name: Deploy
+        id: deploy
+        if: github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          PRODUCTION: ${{ github.event_name == 'push' }}
+          READY_TIMEOUT_MINUTES: ${{ inputs.ready-timeout-minutes }}
         run: |
-          set -o pipefail
-          vercel deploy --archive=tgz --token="${{ secrets.VERCEL_TOKEN }}" --yes \
-            > deploy-out.txt 2> deploy-err.txt || { cat deploy-err.txt >&2; exit 1; }
+          set -euo pipefail
+          args=(deploy --archive=tgz --yes --no-wait --token="$VERCEL_TOKEN")
+          [ "$PRODUCTION" = true ] && args+=(--prod)
+          if ! vercel "${args[@]}" > deploy-out.txt 2> deploy-err.txt; then
+            cat deploy-err.txt >&2
+            echo "::error title=Vercel deploy::vercel deploy failed before the deployment was created"
+            exit 1
+          fi
           cat deploy-err.txt >&2
-          url=$(tail -n1 deploy-out.txt)
-          # Scope to the "Inspect:" line — vercel also prints an unrelated
-          # vercel.com/docs telemetry URL we must not grab.
-          inspect=$(sed -E 's/\x1b\[[0-9;]*m//g' deploy-err.txt \
-            | grep -iE 'inspect' | grep -oE 'https://vercel\.com/[^ ]+' | head -n1 || true)
+          url=$(grep -oE 'https://[^[:space:]]+' deploy-out.txt | tail -n1 || true)
+          if [ -z "$url" ]; then
+            echo "::error title=Vercel deploy::could not read the deployment URL from the CLI output"
+            exit 1
+          fi
           echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "inspect=$inspect" >> "$GITHUB_OUTPUT"
+
+          api="https://api.vercel.com/v13/deployments/${url#https://}?teamId=$VERCEL_ORG_ID"
+          deadline=$(( $(date +%s) + READY_TIMEOUT_MINUTES * 60 ))
+          last=""
+          inspect=""
+          while :; do
+            if ! body=$(curl -fsS --max-time 30 -H "Authorization: Bearer $VERCEL_TOKEN" "$api"); then
+              body=""
+            fi
+            if [ -n "$body" ]; then
+              state=$(jq -r '.readyState // empty' <<<"$body")
+              if [ -z "${inspect:-}" ]; then
+                inspect=$(jq -r '.inspectorUrl // empty' <<<"$body")
+                [ -n "$inspect" ] && echo "inspect=$inspect" >> "$GITHUB_OUTPUT"
+              fi
+              [ "$state" != "$last" ] && echo "readyState: $state" && last=$state
+              case "$state" in
+                READY)
+                  # Production domains are assigned after READY; a failed
+                  # alias leaves the old deployment live, so it is a failure.
+                  alias_error=$(jq -r '.aliasError.message // empty' <<<"$body")
+                  if [ -n "$alias_error" ]; then
+                    echo "state=ALIAS_ERROR" >> "$GITHUB_OUTPUT"
+                    echo "::error title=Vercel deploy::domain assignment failed: $alias_error ($inspect)"
+                    exit 1
+                  fi
+                  if [ "$PRODUCTION" != true ] || [ "$(jq -r '.aliasAssigned // empty' <<<"$body")" != "" ]; then
+                    echo "state=READY" >> "$GITHUB_OUTPUT"
+                    exit 0
+                  fi
+                  ;;
+                ERROR|CANCELED|BLOCKED)
+                  echo "state=$state" >> "$GITHUB_OUTPUT"
+                  reason=$(jq -r '[.errorMessage, .readyStateReason, .errorCode] | map(select(. != null and . != "")) | first // ""' <<<"$body")
+                  link=$(jq -r '.errorLink // empty' <<<"$body")
+                  if [ "$state" = BLOCKED ]; then
+                    author=$(git log -1 --format='%an <%ae>')
+                    echo "::error title=Vercel deployment BLOCKED::Vercel refused to build: the commit author ($author) is not a member of the Vercel team. A team member must author the commit, or an owner must add this author to the team. $reason ${link} ${inspect}"
+                  else
+                    echo "::error title=Vercel deployment $state::${reason:-no reason given} ${link} ${inspect}"
+                    [ "$state" = ERROR ] && timeout 60 vercel inspect "$url" --logs --token="$VERCEL_TOKEN" 2>&1 | tail -n 60 || true
+                  fi
+                  exit 1
+                  ;;
+              esac
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "state=TIMEOUT" >> "$GITHUB_OUTPUT"
+              echo "::error title=Vercel deploy timed out::still ${last:-unknown} after ${READY_TIMEOUT_MINUTES} min; canceling $url"
+              curl -fsS --max-time 30 -X PATCH -H "Authorization: Bearer $VERCEL_TOKEN" \
+                "https://api.vercel.com/v12/deployments/${url#https://}/cancel?teamId=$VERCEL_ORG_ID" > /dev/null || true
+              exit 1
+            fi
+            sleep 10
+          done
 
       # Replaces the comment the Vercel Git integration used to post. Sticky
       # via a hidden marker so re-runs update one comment instead of stacking.
       # continue-on-error: a caller that didn't grant pull-requests: write
       # still gets a green deploy, just no comment.
       - name: Comment preview URL on PR
-        if: github.event_name == 'pull_request' && steps.preview.outputs.url != ''
+        if: always() && github.event_name == 'pull_request' && steps.deploy.outputs.url != ''
         continue-on-error: true
         uses: actions/github-script@v8
         env:
-          PREVIEW_URL: ${{ steps.preview.outputs.url }}
-          INSPECT_URL: ${{ steps.preview.outputs.inspect }}
+          PREVIEW_URL: ${{ steps.deploy.outputs.url }}
+          INSPECT_URL: ${{ steps.deploy.outputs.inspect }}
+          STATE: ${{ steps.deploy.outputs.state }}
         with:
           script: |
             const url = process.env.PREVIEW_URL;
             const inspect = process.env.INSPECT_URL;
+            const state = process.env.STATE || "UNKNOWN";
+            const status = {
+              READY: "✅ Ready",
+              BLOCKED: "⛔ Blocked (commit author not on the Vercel team)",
+              ERROR: "❌ Error",
+              CANCELED: "⚪ Canceled",
+              TIMEOUT: "⏱️ Timed out",
+            }[state] ?? `❔ ${state}`;
             const sha = context.payload.pull_request.head.sha.slice(0, 7);
             const updated = new Date().toISOString().replace("T", " ").slice(0, 16) + " UTC";
             const inspectCell = inspect ? `[Inspect](${inspect})` : "—";
+            const previewCell = state === "READY" ? `[Visit Preview](${url})` : "—";
             const marker = "<!-- vercel-preview-deployment -->";
             const body = [
               marker,
@@ -116,7 +198,7 @@ jobs:
               "",
               "| Project | Status | Preview | Inspect | Commit | Updated |",
               "|---|---|---|---|---|---|",
-              `| \`${context.repo.repo}\` | ✅ Ready | [Visit Preview](${url}) | ${inspectCell} | \`${sha}\` | ${updated} |`,
+              `| \`${context.repo.repo}\` | ${status} | ${previewCell} | ${inspectCell} | \`${sha}\` | ${updated} |`,
             ].join("\n");
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
@@ -127,7 +209,3 @@ jobs:
             } else {
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             }
-
-      - name: Deploy production
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: vercel deploy --prod --archive=tgz --token="${{ secrets.VERCEL_TOKEN }}" --yes

@@ -42,6 +42,14 @@ Deploys from CI via the Vercel CLI (build runs on Vercel, so Neon preview
 branching + migrations behave exactly like a Git-triggered deploy). PR → preview,
 push to `main` → production. Uploads a single tarball (`--archive=tgz`).
 
+The CLI creates the deployment with `--no-wait` and the workflow polls the
+Vercel API itself: it fails fast on `BLOCKED`, `ERROR` or `CANCELED` (with the
+reason as an annotation and in the PR comment), cancels a deployment still not
+`READY` after `ready-timeout-minutes` (default 15), and the job is capped at
+30 minutes. `BLOCKED` means Vercel refused to build because the commit author is
+not a member of the Vercel team — see the Pro collaboration rules in
+[Troubleshoot project collaboration](https://vercel.com/docs/deployments/troubleshoot-project-collaboration).
+
 ```yaml
 name: Deploy
 on:
