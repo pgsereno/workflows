@@ -22,6 +22,17 @@ on:
           app_test databases (e.g. "unaccent btree_gist").
         type: string
         default: "unaccent"
+      postgres-image:
+        description: Postgres image for the test service container.
+        type: string
+        default: "postgres:17"
+      test-db-schema:
+        description: >-
+          How the test database gets its schema: "push" (drizzle-kit push) or
+          "migrate" (drizzle-kit migrate). Use "migrate" when a migration holds
+          SQL the schema files don't describe (functions, triggers, extensions).
+        type: string
+        default: "push"
 
 # Every job carries timeout-minutes, ~10x its slowest recent run (all under
 # 80s): a hung Blacksmith runner bills until GitHub's 6h default kills it.
@@ -77,7 +88,7 @@ jobs:
     timeout-minutes: 15
     services:
       postgres:
-        image: postgres:17
+        image: ${{ inputs.postgres-image }}
         env:
           POSTGRES_USER: dev
           POSTGRES_PASSWORD: dev
@@ -112,8 +123,16 @@ jobs:
             PGPASSWORD=dev psql -h localhost -p 5435 -U dev -d app_test -c "CREATE EXTENSION IF NOT EXISTS $ext;"
           done
 
-      - name: Push schema to test database
-        run: cd packages/db && POSTGRES_URL=postgres://dev:dev@localhost:5435/app_test pnpm exec drizzle-kit push --force
+      - name: Apply schema to test database
+        env:
+          TEST_DB_SCHEMA: ${{ inputs.test-db-schema }}
+        run: |
+          cd packages/db
+          if [ "$TEST_DB_SCHEMA" = "migrate" ]; then
+            POSTGRES_URL=postgres://dev:dev@localhost:5435/app_test pnpm exec drizzle-kit migrate
+          else
+            POSTGRES_URL=postgres://dev:dev@localhost:5435/app_test pnpm exec drizzle-kit push --force
+          fi
 
       - name: Run tests
         run: pnpm test
