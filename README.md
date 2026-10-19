@@ -34,6 +34,8 @@ jobs:
     #   node-version: "22"     # tuneline
     #   run-test: false        # promos (no test job)
     #   run-knip: false        # promos (no knip)
+    #   postgres-image: "postgres:18"   # fga4postgres wants PG18
+    #   test-db-schema: migrate         # migrations carry SQL push can't see
 ```
 
 ### `deploy-vercel.yml`
