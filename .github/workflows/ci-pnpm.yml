@@ -25,7 +25,7 @@ on:
       postgres-image:
         description: Postgres image for the test service container.
         type: string
-        default: "postgres:17"
+        default: "postgres:18"
       test-db-schema:
         description: >-
           How the test database gets its schema: "push" (drizzle-kit push) or
